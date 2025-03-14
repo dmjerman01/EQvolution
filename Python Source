@@ -1,0 +1,1111 @@
+import tkinter as tk
+from tkinter import filedialog, messagebox, simpledialog
+import os, math, csv, threading, multiprocessing, logging
+import numpy as np
+import matplotlib.pyplot as plt
+from functools import partial
+from scipy.optimize import differential_evolution
+from numba import njit
+from scipy.signal import savgol_filter
+import sounddevice as sd
+from skopt import gp_minimize
+from skopt.space import Real
+import requests  # For measurement lookup
+
+# -------------------------------------------------------------------
+# Logging Configuration
+# -------------------------------------------------------------------
+logging.basicConfig(filename="autoeq.log", level=logging.DEBUG,
+                    format="%(asctime)s %(levelname)s: %(message)s")
+
+# -------------------------------------------------------------------
+# GLOBAL CONFIGURATION
+# -------------------------------------------------------------------
+FREQ_MIN = 20.0
+FREQ_MAX = 20000.0
+NUM_FREQ_POINTS = 300         # Frequency grid resolution
+SAMPLE_RATE = 384000.0        # e.g., 384 kHz
+
+# Default DE parameters (these can be overridden by GUI inputs)
+MAXITER = 100
+POPSIZE = 15
+MAX_WORKERS = multiprocessing.cpu_count()
+
+FINAL_MAX_GAIN = 6.0
+
+# Penalty and weighting parameters:
+GAIN_THRESHOLD = 4.0          # Lower gain threshold to discourage extreme corrections
+OVERLAP_THRESHOLD = 0.90
+SPACING_PENALTY_MULTIPLIER = 50.0  
+
+AVG_GAIN_THRESHOLD = 3.0
+AVG_GAIN_WEIGHT = 500.0
+AVG_Q_THRESHOLD = 2.0
+AVG_Q_WEIGHT = 500.0
+
+VAR_PENALTY_WEIGHT_DEFAULT = 1000.0  
+STD_THRESHOLD_DEFAULT = 0.5         
+
+SMOOTHNESS_MULTIPLIER_DEFAULT = 0.001
+ROUGHNESS_THRESHOLD = 0.5
+
+# -------------------------------------------------------------------
+# REFERENCE CURVES
+# -------------------------------------------------------------------
+HARMAN_2019_OVER_EAR = [
+    (20, 7.61), (31.5, 7.70), (40, 7.39), (50, 6.62), (63, 5.50),
+    (80, 4.26), (100, 2.79), (125, 1.45), (160, 0.06), (200, -1.03),
+    (250, -1.58), (315, -1.71), (400, -1.71), (500, -1.71), (630, -1.70),
+    (800, -1.63), (1000, -1.57), (1250, 0.98), (1600, 3.29), (2000, 5.95),
+    (2500, 7.25), (3000, 8.37), (4000, 9.39), (5000, 7.62), (6000, 6.47),
+    (7000, 5.13), (8000, 3.28), (10000, -0.87), (12000, -4.00), (15000, -8.65),
+    (20000, -12.12)
+]
+
+KNOWLES_CURVE = [
+    (20, 5.0), (50, 4.8), (100, 4.2), (200, 3.0), (400, 1.5),
+    (800, 0.5), (1000, 0.0), (2000, 1.5), (3000, 3.0), (4000, 2.8),
+    (5000, 2.0), (6000, 1.2), (8000, 0.5), (10000, -0.5), (12000, -1.5),
+    (15000, -2.0), (20000, -3.0)
+]
+
+ORATORY_OPTIMUM_HIFI = [
+    (20, -1.65), (31.5, -1.28), (40, -1.38), (50, -1.58), (63, -1.74),
+    (80, -1.67), (100, -1.49), (125, -1.42), (160, -1.42), (200, -1.42),
+    (250, -1.42), (315, -1.42), (400, -1.41), (500, -1.43), (630, -1.44),
+    (800, -1.44), (1000, -1.42), (1250, 0.75), (1600, 1.27), (2000, 2.67),
+    (2500, 6.54), (3000, 8.34), (4000, 8.41), (5000, 6.16), (6000, 5.60),
+    (7000, 2.85), (8000, 1.45), (10000, -1.81), (12000, -4.50), (15000, -7.79),
+    (20000, -12.12)
+]
+
+REFERENCE_CURVES = {
+    "Harman OverEar 2019": HARMAN_2019_OVER_EAR,
+    "Knowles Preferred": KNOWLES_CURVE,
+    "Oratory1990 Optimum HiFi": ORATORY_OPTIMUM_HIFI
+}
+
+# -------------------------------------------------------------------
+# CSV LOADING FUNCTIONS
+# -------------------------------------------------------------------
+def load_headphone_csv(filepath):
+    data = []
+    try:
+        with open(filepath, 'r', encoding='utf-8') as f:
+            reader = csv.reader(f)
+            for row in reader:
+                if len(row) < 2:
+                    continue
+                try:
+                    freq = float(row[0])
+                    val = float(row[1])
+                    data.append((freq, val))
+                except ValueError:
+                    pass
+    except Exception as e:
+        raise Exception(f"Error reading headphone CSV: {e}")
+    data.sort(key=lambda x: x[0])
+    return data
+
+def load_hearing_csv(filepath, partial_factor=0.5):
+    data = []
+    try:
+        with open(filepath, 'r', encoding='utf-8') as f:
+            reader = csv.reader(f)
+            for row in reader:
+                if len(row) < 2:
+                    continue
+                try:
+                    freq = float(row[0])
+                    if len(row) == 2:
+                        loss = float(row[1])
+                    else:
+                        leftEar = float(row[1])
+                        rightEar = float(row[2])
+                        loss = (leftEar + rightEar) / 2.0
+                    loss_dB = nonlinear_scale_hearing(loss, factor=partial_factor, knee=6.0)
+                    data.append((freq, loss_dB))
+                except ValueError:
+                    pass
+    except Exception as e:
+        raise Exception(f"Error reading hearing CSV: {e}")
+    data.sort(key=lambda x: x[0])
+    return data
+
+def nonlinear_scale_hearing(raw_db, factor=0.2, knee=6.0):
+    scaled = raw_db * factor
+    if scaled > knee:
+        scaled = knee + (scaled - knee) * 0.5
+    return scaled
+
+# -------------------------------------------------------------------
+# SMOOTHING & ROUGHNESS FUNCTIONS
+# -------------------------------------------------------------------
+def smooth_data_logspace(data, window_length=7, polyorder=2):
+    if len(data) < window_length:
+        return data
+    data_sorted = sorted(data, key=lambda x: x[0])
+    freqs = np.array([d[0] for d in data_sorted])
+    vals = np.array([d[1] for d in data_sorted])
+    new_freqs = np.logspace(math.log10(freqs[0]), math.log10(freqs[-1]), len(freqs))
+    vals_interp = np.interp(new_freqs, freqs, vals)
+    if window_length >= len(freqs):
+        window_length = max(len(freqs) - 1 if (len(freqs) - 1) % 2 == 1 else len(freqs) - 2, 3)
+    vals_smooth = savgol_filter(vals_interp, window_length, polyorder)
+    final_vals = np.interp(freqs, new_freqs, vals_smooth)
+    return list(zip(freqs, final_vals))
+
+def calculate_roughness(data):
+    if len(data) < 3:
+        return 0.0
+    vals = np.array([d[1] for d in sorted(data, key=lambda x: x[0])])
+    second_diffs = np.diff(vals, n=2)
+    return np.mean(second_diffs ** 2)
+
+def needs_smoothing(data, threshold=0.5):
+    return calculate_roughness(data) > threshold
+
+# -------------------------------------------------------------------
+# MERGE & SUBTRACT FUNCTIONS
+# -------------------------------------------------------------------
+def merge_data(primary, secondary, smooth_before=True, window_length=7, polyorder=2, roughness_threshold=0.5):
+    if not secondary:
+        return primary
+    if smooth_before and (needs_smoothing(primary, roughness_threshold) or needs_smoothing(secondary, roughness_threshold)):
+        primary = smooth_data_logspace(primary, window_length, polyorder)
+        secondary = smooth_data_logspace(secondary, window_length, polyorder)
+    freqs = sorted(set(p[0] for p in primary).union(q[0] for q in secondary))
+    def interp_dB(data, f):
+        if f <= data[0][0]:
+            return data[0][1]
+        if f >= data[-1][0]:
+            return data[-1][1]
+        for i in range(len(data) - 1):
+            f1, g1 = data[i]
+            f2, g2 = data[i + 1]
+            if f1 <= f <= f2:
+                t = (f - f1) / (f2 - f1)
+                return g1 + t * (g2 - g1)
+        return data[-1][1]
+    out = []
+    for f in freqs:
+        p_val = interp_dB(primary, f)
+        s_val = interp_dB(secondary, f)
+        out.append((f, p_val + s_val))
+    return out
+
+def subtract_data(primary, reference, smooth_before=True, window_length=7, polyorder=2, roughness_threshold=0.5):
+    if not reference:
+        return primary
+    if smooth_before and (needs_smoothing(primary, roughness_threshold) or needs_smoothing(reference, roughness_threshold)):
+        primary = smooth_data_logspace(primary, window_length, polyorder)
+        reference = smooth_data_logspace(reference, window_length, polyorder)
+    freqs = sorted(set(p[0] for p in primary).union(q[0] for q in reference))
+    def interp_dB(data, f):
+        if f <= data[0][0]:
+            return data[0][1]
+        if f >= data[-1][0]:
+            return data[-1][1]
+        for i in range(len(data) - 1):
+            f1, g1 = data[i]
+            f2, g2 = data[i + 1]
+            if f1 <= f <= f2:
+                t = (f - f1) / (f2 - f1)
+                return g1 + t * (g2 - g1)
+        return data[-1][1]
+    out = []
+    for f in freqs:
+        p_val = interp_dB(primary, f)
+        r_val = interp_dB(reference, f)
+        out.append((f, p_val - r_val))
+    return out
+
+# -------------------------------------------------------------------
+# BUILD FINAL TARGET CURVE
+# -------------------------------------------------------------------
+def build_target_curve(data):
+    data = np.array(data)
+    sorted_idx = np.argsort(data[:, 0])
+    freqs_data = data[sorted_idx, 0]
+    db_data = data[sorted_idx, 1]
+    freqs = np.logspace(math.log10(FREQ_MIN), math.log10(FREQ_MAX), NUM_FREQ_POINTS)
+    target_db = np.interp(freqs, freqs_data, db_data)
+    max_target = np.max(target_db)
+    if max_target > FINAL_MAX_GAIN:
+        target_db -= (max_target - FINAL_MAX_GAIN)
+    target_db = savgol_filter(target_db, window_length=21, polyorder=5)
+    return freqs, target_db
+
+# -------------------------------------------------------------------
+# FILTER RESPONSE FUNCTIONS (Numba-Jitted)
+# -------------------------------------------------------------------
+@njit
+def low_shelf_filter_magnitude_numba(f, Fc, GdB, Q, sr):
+    A = 10**(GdB/40.0)
+    w0 = 2 * math.pi * (f/sr)
+    cos_w0 = math.cos(w0)
+    sin_w0 = math.sin(w0)
+    alpha = sin_w0 / (2 * Q)
+    b0 = A * ((A+1) - (A-1)*cos_w0 + 2*math.sqrt(A)*alpha)
+    b1 = 2 * A * ((A-1) - (A+1)*cos_w0)
+    b2 = A * ((A+1) - (A-1)*cos_w0 - 2*math.sqrt(A)*alpha)
+    a0 = (A+1) + (A-1)*cos_w0 + 2*math.sqrt(A)*alpha
+    a1 = -2 * ((A-1) + (A+1)*cos_w0)
+    a2 = (A+1) + (A-1)*cos_w0 - 2*math.sqrt(A)*alpha
+    b0 /= a0; b1 /= a0; b2 /= a0
+    a1 /= a0; a2 /= a0
+    ejw1 = complex(math.cos(-w0), math.sin(-w0))
+    ejw2 = complex(math.cos(-2*w0), math.sin(-2*w0))
+    num = b0 + b1 * ejw1 + b2 * ejw2
+    den = 1.0 + a1 * ejw1 + a2 * ejw2
+    return abs(num / den)
+
+@njit
+def high_shelf_filter_magnitude_numba(f, Fc, GdB, Q, sr):
+    A = 10**(GdB/40.0)
+    w0 = 2 * math.pi * (f/sr)
+    cos_w0 = math.cos(w0)
+    sin_w0 = math.sin(w0)
+    alpha = sin_w0 / (2 * Q)
+    b0 = A * ((A+1) + (A-1)*cos_w0 + 2*math.sqrt(A)*alpha)
+    b1 = -2 * A * ((A-1) + (A+1)*cos_w0)
+    b2 = A * ((A+1) + (A-1)*cos_w0 - 2*math.sqrt(A)*alpha)
+    a0 = (A+1) - (A-1)*cos_w0 + 2*math.sqrt(A)*alpha
+    a1 = 2 * ((A-1) - (A+1)*cos_w0)
+    a2 = (A+1) - (A-1)*cos_w0 - 2*math.sqrt(A)*alpha
+    b0 /= a0; b1 /= a0; b2 /= a0
+    a1 /= a0; a2 /= a0
+    ejw1 = complex(math.cos(-w0), math.sin(-w0))
+    ejw2 = complex(math.cos(-2*w0), math.sin(-2*w0))
+    num = b0 + b1 * ejw1 + b2 * ejw2
+    den = 1.0 + a1 * ejw1 + a2 * ejw2
+    return abs(num / den)
+
+@njit
+def peak_filter_magnitude_numba(f, Fc, GdB, Q, sr):
+    A = 10**(GdB/40.0)
+    w = 2 * math.pi * (f/sr)
+    alpha = math.sin(w) / (2 * Q)
+    b0 = 1.0 + alpha * A
+    b1 = -2.0 * math.cos(w)
+    b2 = 1.0 - alpha * A
+    a0 = 1.0 + alpha / A
+    a1 = -2.0 * math.cos(w)
+    a2 = 1.0 - alpha / A
+    b0 /= a0; b1 /= a0; b2 /= a0
+    a1 /= a0; a2 /= a0
+    ejw1 = complex(math.cos(-w), math.sin(-w))
+    ejw2 = complex(math.cos(-2*w), math.sin(-2*w))
+    num = b0 + b1 * ejw1 + b2 * ejw2
+    den = 1.0 + a1 * ejw1 + a2 * ejw2
+    return abs(num / den)
+
+def peak_filter_magnitude(f, Fc, GdB, Q, sr):
+    return peak_filter_magnitude_numba(f, Fc, GdB, Q, sr)
+
+# -------------------------------------------------------------------
+# DYNAMIC SMOOTHNESS MULTIPLIER
+# -------------------------------------------------------------------
+def compute_dynamic_smoothness_multiplier(target_db, base_multiplier=SMOOTHNESS_MULTIPLIER_DEFAULT):
+    second_diffs = np.diff(target_db, n=2)
+    roughness = np.mean(second_diffs ** 2)
+    return base_multiplier / (1 + roughness)
+
+# -------------------------------------------------------------------
+# PERCEPTUAL WEIGHTING (Bark Scale)
+# -------------------------------------------------------------------
+@njit
+def perceptual_weight_numba(f):
+    bark = 13.0 * math.atan(0.00076 * f) + 3.5 * math.atan((f/7500.0)**2)
+    weight = 1.0 + math.exp(-0.5 * ((bark - 9.0)/1.5)**2)
+    return weight
+
+# -------------------------------------------------------------------
+# UPDATED ISO 226–INSPIRED WEIGHTING FUNCTION (Numba-Jitted)
+# -------------------------------------------------------------------
+@njit
+def iso226_weight_numba(f, spl):
+    if f < 1000.0:
+        weight = 1.0 + math.log10(1000.0 / f)
+    elif f > 4000.0:
+        weight = 1.0 + math.log10(f / 4000.0)
+    else:
+        weight = 1.0
+    weight *= (1.0 + 0.02 * (85.0 - spl))
+    return weight
+
+# -------------------------------------------------------------------
+# CRITICAL BAND WEIGHTING FUNCTION
+# -------------------------------------------------------------------
+@njit
+def critical_band_weight(f):
+    if 1000.0 <= f <= 4000.0:
+        return 2.0
+    else:
+        return 1.0
+
+# -------------------------------------------------------------------
+# USER PREFERENCE MAPPING FOR VOCAL CLARITY
+# -------------------------------------------------------------------
+def map_vocal_clarity(rating):
+    return 0.5 + (rating / 10.0)
+
+# -------------------------------------------------------------------
+# IMPROVED PREAMP CALCULATION
+# -------------------------------------------------------------------
+def compute_preamp(final_db, target_max=FINAL_MAX_GAIN):
+    eff_max = np.percentile(final_db, 95)
+    return -(eff_max - target_max) if eff_max > target_max else 0.0
+
+# -------------------------------------------------------------------
+# COST FUNCTION: 2 SHELVES + (n-2) PEAKS
+# -------------------------------------------------------------------
+@njit
+def shelves_peaks_cost_numba(params, freqs, target_db, sample_rate, n_filters,
+                             spl, weights, smoothness_multiplier,
+                             ls_pref, hs_pref, pref_weight, vocal_clarity_weight,
+                             gain_penalty, q_penalty, extra_q_penalty, spacing_penalty,
+                             avg_gain_threshold, avg_gain_weight, avg_q_threshold, avg_q_weight,
+                             var_penalty_weight, std_threshold):
+    N = len(freqs)
+    eq_db_array = np.empty(N)
+    
+    Fc_ls = params[0]
+    G_ls  = params[1]
+    Q_ls  = params[2]
+    Fc_hs = params[3]
+    G_hs  = params[4]
+    Q_hs  = params[5]
+    
+    peak_count = n_filters - 2
+    peak_start = 6
+    
+    for i in range(N):
+        f = freqs[i]
+        eq_lin = 1.0
+        adjusted_ls_gain = G_ls * (1.0 + 0.02 * (85.0 - spl))
+        eq_lin *= low_shelf_filter_magnitude_numba(f, Fc_ls, adjusted_ls_gain, Q_ls, sample_rate)
+        adjusted_hs_gain = G_hs * (1.0 + 0.02 * (85.0 - spl))
+        eq_lin *= high_shelf_filter_magnitude_numba(f, Fc_hs, adjusted_hs_gain, Q_hs, sample_rate)
+        for pk_idx in range(peak_count):
+            base = peak_start + 3 * pk_idx
+            Fc_pk = params[base + 0]
+            G_pk  = params[base + 1]
+            Q_pk  = params[base + 2]
+            eq_lin *= peak_filter_magnitude_numba(f, Fc_pk, G_pk, Q_pk, sample_rate)
+        if eq_lin > 1e-12:
+            eq_db = 20.0 * math.log10(eq_lin)
+        else:
+            eq_db = -999.0
+        eq_db_array[i] = eq_db
+
+    total_cost = 0.0
+    for i in range(N):
+        f = freqs[i]
+        p_weight = weights[i]
+        iso_w = iso226_weight_numba(f, spl)
+        cbw = critical_band_weight(f)
+        diff = target_db[i] - eq_db_array[i]
+        combined_w = p_weight * iso_w * cbw
+        if 800.0 <= f <= 3000.0:
+            combined_w *= vocal_clarity_weight
+        if f < 200.0:
+            combined_w *= 1.5  # Extra boost for lows
+        if f > 8000.0:
+            combined_w *= 1.5  # Extra boost for highs
+        total_cost += combined_w * (diff * diff)
+    
+    penalty = 0.0
+    if adjusted_ls_gain > GAIN_THRESHOLD:
+        mult = 5.0 if Fc_ls < 200.0 else gain_penalty
+        penalty += mult * ((adjusted_ls_gain - GAIN_THRESHOLD) ** 2)
+    q_ls_thresh = 4.0 + 2.0 * math.exp(-Fc_ls/5000.0)
+    if Q_ls > q_ls_thresh:
+        penalty += q_penalty * ((Q_ls - q_ls_thresh) ** 2)
+    if Q_ls > 2.5:
+        penalty += extra_q_penalty * ((Q_ls - 2.5) ** 2)
+    
+    if adjusted_hs_gain > GAIN_THRESHOLD:
+        mult = 5.0 if Fc_hs < 200.0 else gain_penalty
+        penalty += mult * ((adjusted_hs_gain - GAIN_THRESHOLD) ** 2)
+    q_hs_thresh = 4.0 + 2.0 * math.exp(-Fc_hs/5000.0)
+    if Q_hs > q_hs_thresh:
+        penalty += q_penalty * ((Q_hs - q_hs_thresh) ** 2)
+    if Q_hs > 2.5:
+        penalty += extra_q_penalty * ((Q_hs - 2.5) ** 2)
+    
+    for pk_idx in range(peak_count):
+        base = peak_start + 3 * pk_idx
+        Fc_pk = params[base + 0]
+        G_pk  = params[base + 1]
+        Q_pk  = params[base + 2]
+        if G_pk > GAIN_THRESHOLD:
+            mult = 5.0 if Fc_pk < 200.0 else gain_penalty
+            penalty += mult * ((G_pk - GAIN_THRESHOLD) ** 2)
+        q_pk_thresh = 4.0 + 2.0 * math.exp(-Fc_pk/5000.0)
+        if Q_pk > q_pk_thresh:
+            penalty += q_penalty * ((Q_pk - q_pk_thresh) ** 2)
+        if Q_pk > 2.5:
+            penalty += extra_q_penalty * ((Q_pk - 2.5) ** 2)
+    
+    for j in range(peak_count):
+        base_j = peak_start + 3 * j
+        Fc_j = params[base_j + 0]
+        Q_j  = params[base_j + 2]
+        for k in range(j+1, peak_count):
+            base_k = peak_start + 3 * k
+            Fc_k = params[base_k + 0]
+            Q_k = params[base_k + 2]
+            ratio = Fc_j / Fc_k if Fc_j < Fc_k else Fc_k / Fc_j
+            if ratio > OVERLAP_THRESHOLD:
+                Q_avg = (Q_j + Q_k) * 0.5
+                penalty += 100.0 * ((ratio - OVERLAP_THRESHOLD) * (1.0 - 1.0/(1.0 + Q_avg)))
+            if abs(Fc_j - Fc_k) < 100.0:
+                penalty += SPACING_PENALTY_MULTIPLIER * ((100.0 - abs(Fc_j - Fc_k)) ** 2)
+    
+    total_filters = n_filters
+    sum_abs_gain = 0.0
+    sum_q = 0.0
+    for i in range(total_filters):
+        base = 3 * i
+        G_val = params[base + 1]
+        Q_val = params[base + 2]
+        sum_abs_gain += abs(G_val)
+        sum_q += Q_val
+    avg_gain = sum_abs_gain / total_filters
+    avg_q = sum_q / total_filters
+    if avg_gain > AVG_GAIN_THRESHOLD:
+        penalty += AVG_GAIN_WEIGHT * ((avg_gain - AVG_GAIN_THRESHOLD) ** 2)
+    if avg_q > AVG_Q_THRESHOLD:
+        penalty += AVG_Q_WEIGHT * ((avg_q - AVG_Q_THRESHOLD) ** 2)
+    
+    mean_db = 0.0
+    for i in range(N):
+        mean_db += eq_db_array[i]
+    mean_db /= N
+    var_sum = 0.0
+    for i in range(N):
+        diff_val = eq_db_array[i] - mean_db
+        var_sum += diff_val * diff_val
+    var_val = var_sum / N
+    std_dev = math.sqrt(var_val)
+    if std_dev < STD_THRESHOLD_DEFAULT:
+        penalty += VAR_PENALTY_WEIGHT_DEFAULT * ((STD_THRESHOLD_DEFAULT - std_dev) ** 2)
+    
+    penalty += pref_weight * (((G_ls - ls_pref) ** 2) + ((G_hs - hs_pref) ** 2))
+    
+    return total_cost + penalty
+
+def shelves_peaks_cost(params, freqs, target_db, sample_rate, n_filters, spl, weights,
+                       smoothness_multiplier, ls_pref, hs_pref, pref_weight, vocal_clarity_weight,
+                       gain_penalty, q_penalty, extra_q_penalty, spacing_penalty,
+                       avg_gain_threshold, avg_gain_weight, avg_q_threshold, avg_q_weight,
+                       var_penalty_weight, std_threshold):
+    return shelves_peaks_cost_numba(params, freqs, target_db, sample_rate, n_filters,
+                                    spl, weights, smoothness_multiplier,
+                                    ls_pref, hs_pref, pref_weight, vocal_clarity_weight,
+                                    gain_penalty, q_penalty, extra_q_penalty, spacing_penalty,
+                                    avg_gain_threshold, avg_gain_weight, avg_q_threshold, avg_q_weight,
+                                    var_penalty_weight, std_threshold)
+
+def create_shelves_peaks_bounds(n_filters):
+    bounds = []
+    # Low Shelf: Fc [20,300], Gain [-12,12], Q [0.3,4.0]
+    bounds.append((20.0, 300.0))
+    bounds.append((-12.0, 12.0))
+    bounds.append((0.3, 4.0))
+    # High Shelf: Fc [6000,16000], Gain [-12,12], Q [0.3,4.0]
+    bounds.append((6000.0, 16000.0))
+    bounds.append((-12.0, 12.0))
+    bounds.append((0.3, 4.0))
+    # Peaks: Each: Fc [20,16000], Gain [-12,12], Q [0.3,4.0]
+    peak_count = n_filters - 2
+    for _ in range(peak_count):
+        bounds.append((20.0, 16000.0))
+        bounds.append((-12.0, 12.0))
+        bounds.append((0.3, 4.0))
+    return bounds
+
+cost_cache = {}
+
+def cost_function_with_cache(params, freqs, target_db, sample_rate, n_filters, spl, weights,
+                             smoothness_multiplier, ls_pref, hs_pref, pref_weight, vocal_clarity_weight,
+                             gain_penalty, q_penalty, extra_q_penalty, spacing_penalty,
+                             avg_gain_threshold, avg_gain_weight, avg_q_threshold, avg_q_weight,
+                             var_penalty_weight, std_threshold):
+    key = tuple(round(x, 3) for x in params)
+    if key in cost_cache:
+        return cost_cache[key]
+    val = shelves_peaks_cost(params, freqs, target_db, sample_rate, n_filters, spl, weights,
+                             smoothness_multiplier, ls_pref, hs_pref, pref_weight, vocal_clarity_weight,
+                             gain_penalty, q_penalty, extra_q_penalty, spacing_penalty,
+                             avg_gain_threshold, avg_gain_weight, avg_q_threshold, avg_q_weight,
+                             var_penalty_weight, std_threshold)
+    cost_cache[key] = val
+    return val
+
+def global_cost_func(params, freqs, target_db, sample_rate, n_filters, spl, weights,
+                     smoothness_multiplier, ls_pref, hs_pref, pref_weight, vocal_clarity_weight,
+                     gain_penalty, q_penalty, extra_q_penalty, spacing_penalty,
+                     avg_gain_threshold, avg_gain_weight, avg_q_threshold, avg_q_weight,
+                     var_penalty_weight, std_threshold):
+    return cost_function_with_cache(params, freqs, target_db, sample_rate, n_filters, spl, weights,
+                                    smoothness_multiplier, ls_pref, hs_pref, pref_weight, vocal_clarity_weight,
+                                    gain_penalty, q_penalty, extra_q_penalty, spacing_penalty,
+                                    avg_gain_threshold, avg_gain_weight, avg_q_threshold, avg_q_weight,
+                                    var_penalty_weight, std_threshold)
+
+def remove_filter(params, filter_index, n_filters):
+    if filter_index < 2 or filter_index >= n_filters:
+        return params, n_filters
+    start = filter_index * 3
+    new_params = params[:start] + params[start+3:]
+    new_filter_count = n_filters - 1
+    return new_params, new_filter_count
+
+def prune_filters(best_params, freqs, target_db, sample_rate, n_filters, spl, weights,
+                  smoothness_multiplier, ls_pref, hs_pref, pref_weight, vocal_clarity_weight,
+                  gain_penalty, q_penalty, extra_q_penalty, spacing_penalty,
+                  avg_gain_threshold, avg_gain_weight, avg_q_threshold, avg_q_weight,
+                  var_penalty_weight, std_threshold):
+    current_params = best_params
+    current_filter_count = n_filters
+    current_cost = global_cost_func(current_params, freqs, target_db, sample_rate, current_filter_count, spl, weights,
+                                     smoothness_multiplier, ls_pref, hs_pref, pref_weight, vocal_clarity_weight,
+                                     gain_penalty, q_penalty, extra_q_penalty, spacing_penalty,
+                                     avg_gain_threshold, avg_gain_weight, avg_q_threshold, avg_q_weight,
+                                     var_penalty_weight, std_threshold)
+    improved = True
+    while improved and current_filter_count > 2:
+        improved = False
+        for filter_index in range(2, current_filter_count):
+            new_params, new_filter_count = remove_filter(current_params, filter_index, current_filter_count)
+            new_cost = global_cost_func(new_params, freqs, target_db, SAMPLE_RATE, new_filter_count, spl, weights,
+                                         smoothness_multiplier, ls_pref, hs_pref, pref_weight, vocal_clarity_weight,
+                                         gain_penalty, q_penalty, extra_q_penalty, spacing_penalty,
+                                         avg_gain_threshold, avg_gain_weight, avg_q_threshold, avg_q_weight,
+                                         var_penalty_weight, std_threshold)
+            if new_cost < current_cost:
+                current_params = new_params
+                current_filter_count = new_filter_count
+                current_cost = new_cost
+                improved = True
+                break
+    return current_params, current_filter_count, current_cost
+
+# -------------------------------------------------------------------
+# HYBRID OPTIMIZATION (DE + BO) USING "LCB" ACQUISITION FUNCTION
+# -------------------------------------------------------------------
+def process_eq_optimization_hybrid(freqs, target_db, n_filters, spl, weights,
+                                   smoothness_multiplier, ls_pref, hs_pref, pref_weight, vocal_clarity_weight,
+                                   gain_penalty, q_penalty, extra_q_penalty, spacing_penalty,
+                                   avg_gain_threshold, avg_gain_weight, avg_q_threshold, avg_q_weight,
+                                   var_penalty_weight, std_threshold):
+    bounds = create_shelves_peaks_bounds(n_filters)
+    args = (freqs, target_db, SAMPLE_RATE, n_filters, spl, weights, smoothness_multiplier,
+            ls_pref, hs_pref, pref_weight, vocal_clarity_weight,
+            gain_penalty, q_penalty, extra_q_penalty, spacing_penalty,
+            avg_gain_threshold, avg_gain_weight, avg_q_threshold, avg_q_weight,
+            var_penalty_weight, std_threshold)
+    
+    de_result = differential_evolution(global_cost_func, bounds, args=args,
+                                       strategy='best1bin', maxiter=MAXITER, popsize=POPSIZE,
+                                       workers=MAX_WORKERS)
+    best_params = de_result.x
+    space = [Real(b[0], b[1]) for b in bounds]
+    def bo_cost_func(x):
+        return global_cost_func(x, *args)
+    bo_result = gp_minimize(bo_cost_func, space, x0=best_params.tolist(), n_calls=30,
+                              random_state=42, acq_func="LCB")
+    refined_params = bo_result.x
+    return refined_params
+
+# -------------------------------------------------------------------
+# MULTI-FILTER OPTIMIZATION (Cost vs. Filter Count)
+# -------------------------------------------------------------------
+def multi_filter_optimization(freqs, target_db, spl, weights, ls_offset, hs_offset, pref_weight, vocal_clarity_w, filter_counts):
+    results = []
+    for n in filter_counts:
+        eq_params = staged_optimization(freqs, target_db, n, spl, weights, ls_offset, hs_offset, pref_weight, vocal_clarity_w)
+        cost = global_cost_func(eq_params, freqs, target_db, SAMPLE_RATE, n, spl, weights,
+                                compute_dynamic_smoothness_multiplier(target_db),
+                                ls_offset, hs_offset, pref_weight, vocal_clarity_w,
+                                10.0, 50.0, 100.0, SPACING_PENALTY_MULTIPLIER,
+                                3.0, 500.0, 2.0, 500.0,
+                                VAR_PENALTY_WEIGHT_DEFAULT, STD_THRESHOLD_DEFAULT)
+        results.append((n, eq_params, cost))
+    return results
+
+def iterative_staged_optimization(freqs, target_db, spl, weights, ls_offset, hs_offset, pref_weight, vocal_clarity_w,
+                                  min_filters, max_filters=40, improvement_threshold=0.0):
+    best_cost = None
+    best_params = None
+    best_filter_count = None
+    for n in range(min_filters, max_filters + 1):
+        eq_params = staged_optimization(freqs, target_db, n, spl, weights, ls_offset, hs_offset, pref_weight, vocal_clarity_w)
+        cost = global_cost_func(eq_params, freqs, target_db, SAMPLE_RATE, n, spl, weights,
+                                compute_dynamic_smoothness_multiplier(target_db),
+                                ls_offset, hs_offset, pref_weight, vocal_clarity_w,
+                                10.0, 50.0, 100.0, SPACING_PENALTY_MULTIPLIER,
+                                3.0, 500.0, 2.0, 500.0,
+                                VAR_PENALTY_WEIGHT_DEFAULT, STD_THRESHOLD_DEFAULT)
+        if best_cost is None:
+            best_cost = cost
+            best_params = eq_params
+            best_filter_count = n
+        else:
+            improvement = (best_cost - cost) / best_cost
+            if improvement <= improvement_threshold:
+                break
+            else:
+                best_cost = cost
+                best_params = eq_params
+                best_filter_count = n
+    return best_params, best_filter_count, best_cost
+
+def staged_optimization(freqs, target_db, n_filters, spl, weights,
+                        ls_offset, hs_offset, pref_weight, vocal_clarity_weight):
+    # Stage 1: Loose constraints (simulate early, exploratory phase)
+    loose_gain = 2.0
+    loose_q = 20.0
+    loose_extra_q = 50.0
+    loose_spacing = SPACING_PENALTY_MULTIPLIER
+    loose_avg_gain_thresh = 4.0
+    loose_avg_gain_weight = 200.0
+    loose_avg_q_thresh = 2.5
+    loose_avg_q_weight = 200.0
+
+    eq_stage1 = process_eq_optimization_hybrid(
+        freqs, target_db, n_filters, spl, weights,
+        compute_dynamic_smoothness_multiplier(target_db),
+        ls_offset, hs_offset, pref_weight, vocal_clarity_weight,
+        loose_gain, loose_q, loose_extra_q, loose_spacing,
+        loose_avg_gain_thresh, loose_avg_gain_weight, loose_avg_q_thresh, loose_avg_q_weight,
+        VAR_PENALTY_WEIGHT_DEFAULT, STD_THRESHOLD_DEFAULT
+    )
+    # Stage 2: Tighter constraints (simulate later stages with refined search)
+    tight_gain = 10.0
+    tight_q = 50.0
+    tight_extra_q = 100.0
+    tight_spacing = SPACING_PENALTY_MULTIPLIER
+    tight_avg_gain_thresh = 3.0
+    tight_avg_gain_weight = 500.0
+    tight_avg_q_thresh = 2.0
+    tight_avg_q_weight = 500.0
+
+    eq_stage2 = process_eq_optimization_hybrid(
+        freqs, target_db, n_filters, spl, weights,
+        compute_dynamic_smoothness_multiplier(target_db),
+        ls_offset, hs_offset, pref_weight, vocal_clarity_weight,
+        tight_gain, tight_q, tight_extra_q, tight_spacing,
+        tight_avg_gain_thresh, tight_avg_gain_weight, tight_avg_q_thresh, tight_avg_q_weight,
+        VAR_PENALTY_WEIGHT_DEFAULT, STD_THRESHOLD_DEFAULT
+    )
+    return eq_stage2
+
+def play_tone(freq, duration, amplitude, sample_rate=44100):
+    t = np.linspace(0, duration, int(sample_rate * duration), endpoint=False)
+    tone = amplitude * np.sin(2 * math.pi * freq * t)
+    sd.play(tone, sample_rate)
+    sd.wait()
+
+# -------------------------------------------------------------------
+# Modified Hearing Test with Cancel Option
+# -------------------------------------------------------------------
+def run_hearing_test(self):
+    test_window = tk.Toplevel(self.master)
+    test_window.title("Hearing Test")
+    cancel_flag = {"cancel": False}
+
+    def cancel_test():
+        cancel_flag["cancel"] = True
+        test_window.destroy()
+
+    tk.Label(test_window, text="Hearing Test in Progress...").pack(padx=10, pady=10)
+    tk.Button(test_window, text="Cancel Hearing Test", command=cancel_test).pack(padx=10, pady=10)
+
+    sample_rate = 44100
+    test_freqs = [250, 500, 1000, 2000, 3000, 4000, 6000, 8000]
+    thresholds = []
+    for freq in test_freqs:
+        if cancel_flag["cancel"]:
+            messagebox.showinfo("Hearing Test", "Hearing test canceled. No hearing data will be used.")
+            self.hearing_test_data = None
+            return
+        print(f"\nTesting {freq} Hz:")
+        low_amp = 0.0
+        high_amp = 1.0
+        threshold_amp = None
+        for i in range(10):
+            if cancel_flag["cancel"]:
+                messagebox.showinfo("Hearing Test", "Hearing test canceled. No hearing data will be used.")
+                self.hearing_test_data = None
+                test_window.destroy()
+                return
+            mid_amp = (low_amp + high_amp) / 2
+            print(f"Playing tone at amplitude {mid_amp:.3f}")
+            play_tone(freq, duration=1.0, amplitude=mid_amp, sample_rate=sample_rate)
+            response = tk.messagebox.askyesno("Hearing Test", f"At {freq} Hz, can you hear the tone in both ears?")
+            if response:
+                high_amp = mid_amp
+                threshold_amp = mid_amp
+            else:
+                low_amp = mid_amp
+        threshold_dB = 20 * math.log10(threshold_amp) if (threshold_amp and threshold_amp > 0) else -999
+        thresholds.append((freq, threshold_dB))
+    test_window.destroy()
+    partial_factor = self.hearing_factor_var.get()
+    hearing_test_data = []
+    for (freq, db_val) in thresholds:
+        scaled_val = nonlinear_scale_hearing(db_val, factor=partial_factor, knee=6.0)
+        hearing_test_data.append((freq, scaled_val))
+    self.hearing_test_data = sorted(hearing_test_data, key=lambda x: x[0])
+    print("\nHearing Test Results:")
+    for freq, val in self.hearing_test_data:
+        print(f"{freq} Hz: {val:.2f} dB")
+    tk.messagebox.showinfo("Hearing Test", "Hearing test complete! Results stored internally.\nRe-run optimization to use these thresholds.")
+
+# -------------------------------------------------------------------
+# HEADPHONE MEASUREMENTS LOOKUP FROM AUTOEQ REPOSITORY
+# -------------------------------------------------------------------
+def lookup_headphone_measurements():
+    model_name = simpledialog.askstring("Lookup Measurements", "Enter headphone model name:")
+    if not model_name:
+        return None
+    query = f"{model_name} in:file repo:jaakkopasanen/AutoEq"
+    url = f"https://api.github.com/search/code?q={query}"
+    try:
+        response = requests.get(url)
+        if response.status_code != 200:
+            messagebox.showerror("Lookup Error", f"Error querying GitHub API: {response.status_code}")
+            return None
+        results = response.json().get("items", [])
+        if not results:
+            messagebox.showinfo("Lookup", "No measurements found for that model.")
+            return None
+        file_url = results[0]["html_url"]
+        messagebox.showinfo("Lookup", f"Found measurement file:\n{file_url}\nDownload manually or integrate a downloader here.")
+        return file_url
+    except Exception as e:
+        messagebox.showerror("Lookup Error", f"Error: {e}")
+        return None
+
+# -------------------------------------------------------------------
+# TKINTER GUI CLASS
+# -------------------------------------------------------------------
+class AutoEQPEQGUI:
+    def __init__(self, master):
+        self.master = master
+        self.master.title("EQvolution")
+        
+        self.headphone_file = None
+        self.hearing_file = None
+        self.output_file = None
+        self.loaded_hp_data = None
+        self.loaded_hearing_data = None
+        self.hearing_test_data = None
+        self.target_curve = "Harman OverEar 2019"
+        
+        self.num_filters_var = tk.IntVar(value=10)  # User-chosen initial filter count
+        self.spl_var = tk.DoubleVar(value=85.0)
+        self.hearing_factor_var = tk.DoubleVar(value=0.15)
+        
+        self.bass_pref_var = tk.DoubleVar(value=0.0)
+        self.treble_pref_var = tk.DoubleVar(value=0.0)
+        self.vocal_clarity_var = tk.DoubleVar(value=5.0)
+        
+        self.maxiter_var = tk.IntVar(value=100)
+        self.popsize_var = tk.IntVar(value=15)
+        self.save_graphs_var = tk.BooleanVar(value=False)
+        
+        row = 0
+        tk.Label(master, text="Headphone CSV:").grid(row=row, column=0, sticky="e", padx=5, pady=5)
+        tk.Button(master, text="Browse...", command=self.select_headphone_file).grid(row=row, column=1, padx=5, pady=5)
+        self.lbl_hp = tk.Label(master, text="No file selected")
+        self.lbl_hp.grid(row=row, column=2, padx=5, pady=5)
+        row += 1
+        
+        tk.Label(master, text="Hearing CSV (optional):").grid(row=row, column=0, sticky="e", padx=5, pady=5)
+        tk.Button(master, text="Browse...", command=self.select_hearing_file).grid(row=row, column=1, padx=5, pady=5)
+        self.lbl_hr = tk.Label(master, text="No file selected")
+        self.lbl_hr.grid(row=row, column=2, padx=5, pady=5)
+        row += 1
+        
+        tk.Label(master, text="Output EQ File:").grid(row=row, column=0, sticky="e", padx=5, pady=5)
+        tk.Button(master, text="Browse...", command=self.select_output_file).grid(row=row, column=1, padx=5, pady=5)
+        self.lbl_out = tk.Label(master, text="No file selected")
+        self.lbl_out.grid(row=row, column=2, padx=5, pady=5)
+        row += 1
+        
+        tk.Label(master, text="Reference Curve:").grid(row=row, column=0, sticky="e", padx=5, pady=5)
+        self.ref_curve_var = tk.StringVar(value=list(REFERENCE_CURVES.keys())[0])
+        tk.OptionMenu(master, self.ref_curve_var, *REFERENCE_CURVES.keys()).grid(row=row, column=1, padx=5, pady=5)
+        row += 1
+        
+        tk.Label(master, text="Initial Filter Count:").grid(row=row, column=0, sticky="e", padx=5, pady=5)
+        tk.Spinbox(master, from_=1, to=40, textvariable=self.num_filters_var).grid(row=row, column=1, padx=5, pady=5)
+        row += 1
+        
+        tk.Label(master, text="Listening SPL (dB):").grid(row=row, column=0, sticky="e", padx=5, pady=5)
+        tk.Spinbox(master, from_=50, to=100, textvariable=self.spl_var, increment=1).grid(row=row, column=1, padx=5, pady=5)
+        row += 1
+        
+        tk.Label(master, text="Hearing Factor (0..1):").grid(row=row, column=0, sticky="e", padx=5, pady=5)
+        tk.Spinbox(master, from_=0.0, to=1.0, textvariable=self.hearing_factor_var, increment=0.05).grid(row=row, column=1, padx=5, pady=5)
+        row += 1
+        
+        tk.Label(master, text="Bass Preference (-4..+4):").grid(row=row, column=0, sticky="e", padx=5, pady=5)
+        tk.Scale(master, variable=self.bass_pref_var, from_=-4.0, to=4.0, orient=tk.HORIZONTAL, resolution=0.5).grid(row=row, column=1, padx=5, pady=5)
+        row += 1
+        
+        tk.Label(master, text="Treble Preference (-4..+4):").grid(row=row, column=0, sticky="e", padx=5, pady=5)
+        tk.Scale(master, variable=self.treble_pref_var, from_=-4.0, to=4.0, orient=tk.HORIZONTAL, resolution=0.5).grid(row=row, column=1, padx=5, pady=5)
+        row += 1
+        
+        tk.Label(master, text="Vocal Clarity (0..10):").grid(row=row, column=0, sticky="e", padx=5, pady=5)
+        tk.Scale(master, variable=self.vocal_clarity_var, from_=0, to=10, orient=tk.HORIZONTAL, resolution=1).grid(row=row, column=1, padx=5, pady=5)
+        row += 1
+        
+        tk.Label(master, text="Max Iterations (DE):").grid(row=row, column=0, sticky="e", padx=5, pady=5)
+        tk.Spinbox(master, from_=50, to=1000, textvariable=self.maxiter_var, increment=50).grid(row=row, column=1, padx=5, pady=5)
+        row += 1
+        
+        tk.Label(master, text="Population Size (DE):").grid(row=row, column=0, sticky="e", padx=5, pady=5)
+        tk.Spinbox(master, from_=5, to=100, textvariable=self.popsize_var, increment=5).grid(row=row, column=1, padx=5, pady=5)
+        row += 1
+        
+        tk.Checkbutton(master, text="Save Final Graph", variable=self.save_graphs_var).grid(row=row, column=0, columnspan=3, sticky="w", padx=5, pady=5)
+        row += 1
+        
+        tk.Button(master, text="Lookup Headphone Measurements", command=self.lookup_measurements).grid(row=row, column=0, columnspan=3, pady=10)
+        row += 1
+        
+        tk.Button(master, text="Run Hearing Test", command=self.run_hearing_test_thread).grid(row=row, column=0, columnspan=3, pady=10)
+        row += 1
+        
+        tk.Button(master, text="Run Multi-Filter Optimization", command=self.run_multi_filter_optimization).grid(row=row, column=0, columnspan=3, pady=10)
+        row += 1
+        
+        self.status_label = tk.Label(master, text="", fg="blue")
+        self.status_label.grid(row=row, column=0, columnspan=3, pady=10)
+    
+    def select_headphone_file(self):
+        fname = filedialog.askopenfilename(title="Select Headphone CSV",
+                                           filetypes=[("CSV Files", "*.csv"), ("All Files", "*.*")])
+        if fname:
+            self.headphone_file = fname
+            self.lbl_hp.config(text=os.path.basename(fname))
+            self.loaded_hp_data = load_headphone_csv(fname)
+    
+    def select_hearing_file(self):
+        fname = filedialog.askopenfilename(title="Select Hearing CSV",
+                                           filetypes=[("CSV Files", "*.csv"), ("All Files", "*.*")])
+        if fname:
+            self.hearing_file = fname
+            self.lbl_hr.config(text=os.path.basename(fname))
+            self.loaded_hearing_data = load_hearing_csv(fname)
+    
+    def select_output_file(self):
+        fname = filedialog.asksaveasfilename(defaultextension=".txt",
+                                             filetypes=[("Text Files", "*.txt"), ("All Files", "*.*")])
+        if fname:
+            self.output_file = fname
+            self.lbl_out.config(text=os.path.basename(fname))
+    
+    def lookup_measurements(self):
+        url = lookup_headphone_measurements()
+        if url:
+            messagebox.showinfo("Lookup Result", f"Found measurement file:\n{url}\nPlease download it and load it into the app.")
+    
+    def run_multi_filter_optimization(self):
+        if not self.loaded_hp_data or not self.output_file:
+            messagebox.showerror("Error", "Headphone data and output file are required!")
+            return
+
+        # Enforce safe DE parameters from GUI
+        try:
+            max_iter = int(self.maxiter_var.get())
+            pop_size = int(self.popsize_var.get())
+        except Exception:
+            max_iter = 100
+            pop_size = 15
+
+        if max_iter < 50 or max_iter > 1000:
+            messagebox.showwarning("Warning", "Max iterations must be between 50 and 1000. Resetting to default (100).")
+            self.maxiter_var.set(100)
+            max_iter = 100
+        if pop_size < 5 or pop_size > 100:
+            messagebox.showwarning("Warning", "Population size must be between 5 and 100. Resetting to default (15).")
+            self.popsize_var.set(15)
+            pop_size = 15
+
+        global MAXITER, POPSIZE
+        MAXITER = max_iter
+        POPSIZE = pop_size
+
+        self.status_label.config(text="Running Multi-Filter Optimization...", fg="blue")
+        self.master.update_idletasks()
+        
+        chosen_curve = self.ref_curve_var.get()
+        ref_data = REFERENCE_CURVES[chosen_curve]
+        hp_data = self.loaded_hp_data
+        
+        needed_correction = subtract_data(hp_data, ref_data)
+        freqs_grid, target_gains = build_target_curve(needed_correction)
+        weights = np.array([perceptual_weight_numba(f) for f in freqs_grid])
+        
+        ls_offset = self.bass_pref_var.get()
+        hs_offset = self.treble_pref_var.get()
+        spl = self.spl_var.get()
+        vocal_clarity_w = map_vocal_clarity(self.vocal_clarity_var.get())
+        
+        # 1) Solve for the user-chosen initial filter count
+        initial_n = self.num_filters_var.get()
+        initial_eq_params = staged_optimization(freqs_grid, target_gains, initial_n, spl,
+                                                weights, ls_offset, hs_offset, 1.0, vocal_clarity_w)
+        initial_cost = global_cost_func(initial_eq_params, freqs_grid, target_gains, SAMPLE_RATE, initial_n, spl, weights,
+                                        compute_dynamic_smoothness_multiplier(target_gains),
+                                        ls_offset, hs_offset, 1.0, vocal_clarity_w,
+                                        10.0, 50.0, 100.0, SPACING_PENALTY_MULTIPLIER,
+                                        3.0, 500.0, 2.0, 500.0,
+                                        VAR_PENALTY_WEIGHT_DEFAULT, STD_THRESHOLD_DEFAULT)
+        # 2) Multi-filter approach for [8, 16, 32]
+        filter_counts_to_try = [8, 16, 32]
+        results = multi_filter_optimization(freqs_grid, target_gains, spl, weights,
+                                            ls_offset, hs_offset, 1.0, vocal_clarity_w,
+                                            filter_counts_to_try)
+        fc_values = [r[0] for r in results]
+        costs = [r[2] for r in results]
+        plt.figure()
+        plt.plot(fc_values, costs, marker="o")
+        plt.xlabel("Filter Count")
+        plt.ylabel("Cost")
+        plt.title("Multi-Filter Optimization: Cost vs. Filter Count")
+        plt.grid(True)
+        plt.show()
+        
+        best_n, best_eq_params, best_cost = min(results, key=lambda x: x[2])
+        
+        self.status_label.config(text=f"User-chosen: {initial_n} filters, cost={initial_cost:.2f}\n"
+                                      f"Multi-filter best: {best_n} filters, cost={best_cost:.2f}", fg="blue")
+        
+        msg_text = (f"User-chosen solution: {initial_n} filters, cost={initial_cost:.2f}\n"
+                    f"Multi-filter best: {best_n} filters, cost={best_cost:.2f}\n\n"
+                    "Click 'Yes' to use the multi-filter solution, or 'No' to use your initial solution.")
+        use_multi = messagebox.askyesno("Choose Solution", msg_text)
+        if use_multi:
+            final_params = best_eq_params
+            final_filter_count = best_n
+            final_cost = best_cost
+        else:
+            final_params = initial_eq_params
+            final_filter_count = initial_n
+            final_cost = initial_cost
+
+        self.status_label.config(text=f"Final chosen solution: {final_filter_count} filters, cost={final_cost:.2f}", fg="green")
+        
+        # Build final EQ response:
+        Fc_ls = final_params[0]
+        G_ls  = final_params[1]
+        Q_ls  = final_params[2]
+        Fc_hs = final_params[3]
+        G_hs  = final_params[4]
+        Q_hs  = final_params[5]
+        peak_start = 6
+        peak_count = final_filter_count - 2
+        
+        eq_db = []
+        for f in freqs_grid:
+            eq_lin = 1.0
+            adj_ls = G_ls * (1.0 + 0.02 * (85.0 - spl))
+            eq_lin *= low_shelf_filter_magnitude_numba(f, Fc_ls, adj_ls, Q_ls, SAMPLE_RATE)
+            adj_hs = G_hs * (1.0 + 0.02 * (85.0 - spl))
+            eq_lin *= high_shelf_filter_magnitude_numba(f, Fc_hs, adj_hs, Q_hs, SAMPLE_RATE)
+            for i in range(peak_count):
+                base = peak_start + 3 * i
+                Fc_pk = final_params[base + 0]
+                G_pk  = final_params[base + 1]
+                Q_pk  = final_params[base + 2]
+                eq_lin *= peak_filter_magnitude_numba(f, Fc_pk, G_pk, Q_pk, SAMPLE_RATE)
+            eq_val = 20.0 * math.log10(eq_lin) if eq_lin > 1e-12 else -999.0
+            eq_db.append(eq_val)
+        eq_db = np.array(eq_db)
+        preamp = compute_preamp(eq_db, target_max=FINAL_MAX_GAIN)
+        
+        lines = []
+        lines.append(f"Preamp: {preamp:.2f} dB")
+        lines.append(f"Filter 1: ON LS Fc {Fc_ls:.2f} Hz Gain {G_ls:.2f} dB Q {Q_ls:.2f}")
+        lines.append(f"Filter 2: ON HS Fc {Fc_hs:.2f} Hz Gain {G_hs:.2f} dB Q {Q_hs:.2f}")
+        for i in range(peak_count):
+            base = peak_start + 3 * i
+            Fc_pk = final_params[base + 0]
+            G_pk  = final_params[base + 1]
+            Q_pk  = final_params[base + 2]
+            filter_index = i + 3
+            lines.append(f"Filter {filter_index}: ON PK Fc {Fc_pk:.2f} Hz Gain {G_pk:.2f} dB Q {Q_pk:.2f}")
+        
+        try:
+            with open(self.output_file, "w", encoding="utf-8") as f:
+                for ln in lines:
+                    f.write(ln + "\n")
+            self.status_label.config(text=f"EQ saved using {final_filter_count} filters (Cost: {final_cost:.2f}).", fg="green")
+        except Exception as e:
+            messagebox.showerror("Error", f"File write error: {e}")
+        
+        self.show_results(freqs_grid, target_gains, eq_db, preamp)
+    
+    def show_results(self, freqs, target_db, final_db, preamp):
+        plt.figure(figsize=(12, 8))
+        ticks = [20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000]
+        labels = ["20", "50", "100", "200", "500", "1k", "2k", "5k", "10k", "20k"]
+        
+        plt.subplot(3, 1, 1)
+        plt.plot(freqs, target_db, label="Needed Correction Curve", linestyle="--", color="blue")
+        plt.xscale("log")
+        plt.xticks(ticks, labels)
+        plt.xlim([20, 20000])
+        plt.xlabel("Frequency (Hz)")
+        plt.ylabel("Gain (dB)")
+        plt.title("Before: Needed Correction")
+        plt.legend()
+        plt.grid(True, which="both", linestyle=":")
+        
+        plt.subplot(3, 1, 2)
+        plt.plot(freqs, final_db, label="Final EQ Response", color="red")
+        plt.xscale("log")
+        plt.xticks(ticks, labels)
+        plt.xlim([20, 20000])
+        plt.xlabel("Frequency (Hz)")
+        plt.ylabel("Gain (dB)")
+        plt.title(f"After: Optimized EQ (Preamp={preamp:.2f} dB)")
+        plt.legend()
+        plt.grid(True, which="both", linestyle=":")
+        
+        plt.subplot(3, 1, 3)
+        error_curve = target_db - final_db
+        plt.plot(freqs, error_curve, label="Error (Target - EQ)", color="green")
+        plt.axhline(0, color="black", linestyle="--")
+        plt.fill_between(freqs, -2, 2, color="gray", alpha=0.2, label="±2 dB Tolerance")
+        plt.xscale("log")
+        plt.xticks(ticks, labels)
+        plt.xlim([20, 20000])
+        plt.xlabel("Frequency (Hz)")
+        plt.ylabel("Error (dB)")
+        plt.title("Error Curve")
+        plt.legend()
+        plt.grid(True, which="both", linestyle=":")
+        
+        plt.tight_layout()
+        plt.show()
+    
+    def run_hearing_test_thread(self):
+        threading.Thread(target=run_hearing_test, args=(self,), daemon=True).start()
+
+def main():
+    multiprocessing.freeze_support()
+    root = tk.Tk()
+    gui = AutoEQPEQGUI(root)
+    root.mainloop()
+
+if __name__ == "__main__":
+    main()
